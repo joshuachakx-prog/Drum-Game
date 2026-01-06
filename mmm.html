@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>7-Key Drum Pro - 專業鼓組版</title>
+    <script src="https://unpkg.com/@tonejs/midi"></script>
+    <style>
+        * { -webkit-tap-highlight-color: transparent; touch-action: none; user-select: none; -webkit-user-select: none; }
+        body { background: #121212; color: white; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding-top: 10px; overflow: hidden; height: 100vh; }
+        .controls { background: #222; padding: 10px; border-radius: 10px; margin-bottom: 5px; text-align: center; display: flex; gap: 5px; align-items: center; justify-content: center; flex-wrap: wrap; width: 95%; }
+        canvas { background: #000; border: 2px solid #333; border-radius: 5px; max-width: 98vw; max-height: 70vh; height: auto; }
+        .info-panel { display: flex; gap: 15px; margin-top: 5px; font-size: 1rem; font-weight: bold; align-items: center; }
+        .file-group { display: flex; flex-direction: column; align-items: flex-start; font-size: 0.7em; }
+        button { padding: 8px 12px; cursor: pointer; border: none; font-weight: bold; border-radius: 4px; transition: 0.2s; }
+        #startBtn { background: #00d4ff; color: #000; }
+        #pauseBtn { background: #ffcc00; color: #000; display: none; }
+        #restartBtn { background: #ff4757; color: #fff; display: none; }
+        button:disabled { background: #555; color: #aaa; }
+        #healthBarContainer { width: 120px; height: 15px; background: #333; border-radius: 10px; overflow: hidden; border: 1px solid #555; }
+        #healthFill { width: 100%; height: 100%; background: #2ed573; transition: width 0.2s; }
+    </style>
+</head>
+<body>
+
+    <div class="controls">
+        <div class="file-group"><label>MIDI</label><input type="file" id="midiInput" accept=".mid,.midi"></div>
+        <div class="file-group"><label>MP3</label><input type="file" id="musicInput" accept="audio/*"></div>
+        <button id="startBtn" disabled>等待檔案</button>
+        <button id="pauseBtn">暫停</button>
+        <button id="restartBtn">重開</button>
+    </div>
+
+    <canvas id="gameCanvas" width="420" height="640"></canvas>
+
+    <div class="info-panel">
+        <div id="scoreText">Score: 0</div>
+        <div id="comboText">Combo: 0</div>
+        <div id="healthBarContainer"><div id="healthFill"></div></div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const midiInput = document.getElementById('midiInput');
+    const musicInput = document.getElementById('musicInput');
+    const startBtn = document.getElementById('startBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const restartBtn = document.getElementById('restartBtn');
+    const healthFill = document.getElementById('healthFill');
+
+    const LANES = 7;
+    // 更新鍵盤與標籤對應
+    const KEYS = ['s', 'd', 'f', ' ', 'j', 'k', 'l'];
+    const KEY_LABELS = ['Kick', 'Snare', 'HH', 'Tom1', 'Tom2', 'Tom3', 'Crash'];
+    const LANE_WIDTH = canvas.width / LANES;
+    const JUDGE_LINE_Y = 540;
+    const NOTE_SPEED = 500;   
+    const NOTE_HEIGHT = 20;
+
+    const audioPlayer = new Audio();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    let rawMidiData = [];
+    let gameNotes = [];
+    let isPlaying = false;
+    let isPaused = false;
+    let isCountingDown = false;
+    let countdownValue = 3;
+    let countdownTimer = null;
+    let startTime = 0;       
+    let pauseTimeStart = 0;  
+    let score = 0;
+    let combo = 0;
+    let health = 100;
+    let laneFeedback = new Array(LANES).fill(false);
+    let judgment = { text: "", alpha: 0, scale: 1, color: "white" };
+
+    // --- 鼓組映射邏輯 ---
+    function getDrumLane(midiPitch) {
+        // 基於 General MIDI Drum Map
+        if (midiPitch === 35 || midiPitch === 36) return 0; // 大鼓 Kick
+        if (midiPitch === 38 || midiPitch === 40) return 1; // 小鼓 Snare
+        if ([42, 44, 46].includes(midiPitch)) return 2;    // Hi-Hat (Closed, Pedal, Open)
+        if ([48, 50].includes(midiPitch)) return 3;        // Tom 1 (High)
+        if ([45, 47].includes(midiPitch)) return 4;        // Tom 2 (Mid)
+        if ([41, 43].includes(midiPitch)) return 5;        // Tom 3 (Low/Floor)
+        if ([49, 51, 52, 53, 55, 57, 59].includes(midiPitch)) return 6; // Crash / Cymbals
+        
+        // 如果不在範圍內，使用音高分配作為後備方案
+        return midiPitch % LANES;
+    }
+
+    midiInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const arrayBuffer = await file.arrayBuffer();
+        const midi = new Midi(arrayBuffer);
+        rawMidiData = [];
+        midi.tracks.forEach(track => {
+            track.notes.forEach(note => {
+                rawMidiData.push({ 
+                    time: note.time, 
+                    lane: getDrumLane(note.midi) // 使用新的映射函數
+                });
+            });
+        });
+        rawMidiData.sort((a, b) => a.time - b.time);
+        checkFiles();
+    });
+
+    musicInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        audioPlayer.src = URL.createObjectURL(file);
+        checkFiles();
+    });
+
+    function checkFiles() {
+        if (rawMidiData.length > 0 && audioPlayer.src) {
+            startBtn.disabled = false;
+            startBtn.innerText = "開始演奏";
+        }
+    }
+
+    // --- 核心遊戲循環與渲染 ---
+    function init() { render(); requestAnimationFrame(init); }
+
+    function startSequence() {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        clearInterval(countdownTimer);
+        audioPlayer.pause();
+        audioPlayer.currentTime = 0;
+        isPlaying = false; isPaused = false; isCountingDown = true;
+        countdownValue = 3; score = 0; combo = 0; health = 100;
+        gameNotes = rawMidiData.map(n => ({ ...n, hit: false }));
+        judgment.alpha = 0;
+        startBtn.style.display = "none";
+        pauseBtn.style.display = "inline-block";
+        pauseBtn.innerText = "暫停";
+        restartBtn.style.display = "inline-block";
+        countdownTimer = setInterval(() => {
+            countdownValue--;
+            if (countdownValue <= 0) { clearInterval(countdownTimer); isCountingDown = false; startGame(); }
+        }, 1000);
+    }
+
+    function startGame() { isPlaying = true; audioPlayer.play(); startTime = performance.now(); }
+
+    function togglePause() {
+        if (!isPlaying) return;
+        if (!isPaused) {
+            isPaused = true; audioPlayer.pause(); pauseTimeStart = performance.now();
+            pauseBtn.innerText = "繼續";
+        } else {
+            isPaused = false;
+            startTime += (performance.now() - pauseTimeStart);
+            audioPlayer.play(); pauseBtn.innerText = "暫停";
+        }
+    }
+
+    // --- 輸入處理 (手機與鍵盤) ---
+    function handleActionStart(laneIdx) {
+        if (!isPlaying || isPaused || laneIdx < 0 || laneIdx >= LANES) return;
+        laneFeedback[laneIdx] = true;
+        const currentTime = (performance.now() - startTime) / 1000;
+        const target = gameNotes.find(n => !n.hit && n.lane === laneIdx && Math.abs(n.time - currentTime) < 0.2);
+        if (target) {
+            const diff = Math.abs(target.time - currentTime);
+            target.hit = true;
+            if (diff < 0.07) { score += 200; combo++; health = Math.min(100, health + 2); showJudgment("PERFECT", "#00d4ff"); }
+            else { score += 100; combo++; health = Math.min(100, health + 1); showJudgment("GOOD", "#2ed573"); }
+        }
+    }
+
+    function handleActionEnd(laneIdx) { if (laneIdx >= 0 && laneIdx < LANES) laneFeedback[laneIdx] = false; }
+
+    canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        Array.from(e.changedTouches).forEach(touch => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const laneIdx = Math.floor(((touch.clientX - rect.left) * scaleX) / LANE_WIDTH);
+            handleActionStart(laneIdx);
+        });
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        Array.from(e.changedTouches).forEach(touch => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const laneIdx = Math.floor(((touch.clientX - rect.left) * scaleX) / LANE_WIDTH);
+            handleActionEnd(laneIdx);
+        });
+    }, { passive: false });
+
+    window.addEventListener('keydown', (e) => {
+        const key = e.key === ' ' ? ' ' : e.key.toLowerCase();
+        const idx = KEYS.indexOf(key);
+        if (idx !== -1) { if (key === ' ') e.preventDefault(); handleActionStart(idx); }
+    });
+
+    window.addEventListener('keyup', (e) => {
+        const key = e.key === ' ' ? ' ' : e.key.toLowerCase();
+        const idx = KEYS.indexOf(key);
+        if (idx !== -1) handleActionEnd(idx);
+    });
+
+    function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#111'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        for (let i = 0; i < LANES; i++) {
+            if (laneFeedback[i]) {
+                const grad = ctx.createLinearGradient(0, 0, 0, JUDGE_LINE_Y);
+                grad.addColorStop(0, 'transparent'); grad.addColorStop(1, 'rgba(0, 212, 255, 0.25)');
+                ctx.fillStyle = grad; ctx.fillRect(i * LANE_WIDTH, 0, LANE_WIDTH, JUDGE_LINE_Y);
+            }
+            ctx.strokeStyle = '#333'; ctx.beginPath(); ctx.moveTo(i * LANE_WIDTH, 0); ctx.lineTo(i * LANE_WIDTH, 600); ctx.stroke();
+            ctx.fillStyle = laneFeedback[i] ? '#00d4ff' : '#888';
+            ctx.font = "bold 13px Arial"; ctx.textAlign = "center";
+            ctx.fillText(KEY_LABELS[i], i * LANE_WIDTH + LANE_WIDTH / 2, 580);
+        }
+
+        ctx.fillStyle = '#00d4ff'; ctx.fillRect(0, JUDGE_LINE_Y, canvas.width, 4);
+
+        if (isCountingDown) {
+            ctx.fillStyle = "white"; ctx.font = "bold 80px Arial"; ctx.textAlign = "center";
+            ctx.fillText(countdownValue, canvas.width / 2, canvas.height / 2);
+        }
+
+        if (isPlaying) {
+            const now = isPaused ? pauseTimeStart : performance.now();
+            const currentTime = (now - startTime) / 1000;
+            gameNotes.forEach(note => {
+                if (note.hit) return;
+                const y = JUDGE_LINE_Y - (note.time - currentTime) * NOTE_SPEED;
+                if (y > -50 && y < canvas.height) {
+                    ctx.fillStyle = (note.lane === 0) ? '#ff4757' : (note.lane === 2 ? '#ffcc00' : '#ffffff');
+                    ctx.fillRect(note.lane * LANE_WIDTH + 4, y - NOTE_HEIGHT, LANE_WIDTH - 8, NOTE_HEIGHT);
+                }
+                if (!isPaused && y > JUDGE_LINE_Y + 50) { note.hit = true; combo = 0; health = Math.max(0, health - 8); showJudgment("MISS", "#ff4757"); }
+            });
+        }
+
+        if (judgment.alpha > 0) {
+            ctx.save(); ctx.globalAlpha = judgment.alpha; ctx.textAlign = "center"; ctx.fillStyle = judgment.color;
+            ctx.font = `italic bold ${25 * judgment.scale}px Arial`;
+            ctx.fillText(judgment.text, canvas.width / 2, 250); ctx.restore();
+            if (!isPaused) { judgment.alpha -= 0.03; judgment.scale -= 0.01; }
+        }
+        
+        scoreText.innerText = `Score: ${score}`;
+        comboText.innerText = `Combo: ${combo}`;
+        healthFill.style.width = health + "%";
+    }
+
+    function showJudgment(text, color) { judgment = { text, alpha: 1.0, scale: 1.5, color }; }
+
+    startBtn.addEventListener('click', startSequence);
+    restartBtn.addEventListener('click', startSequence);
+    pauseBtn.addEventListener('click', togglePause);
+
+    init();
+</script>
+</body>
+</html>
