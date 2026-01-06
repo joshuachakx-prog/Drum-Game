@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>7-Key Drum Pro - 在線預載版</title>
+    <script src="https://unpkg.com/@tonejs/midi"></script>
+    <style>
+        * { -webkit-tap-highlight-color: transparent; touch-action: none; user-select: none; }
+        body { background: #121212; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 10px; overflow: hidden; height: 100vh; }
+        #statusInfo { font-size: 14px; color: #00d4ff; margin-bottom: 10px; height: 20px; }
+        canvas { background: #000; border: 2px solid #333; border-radius: 5px; max-width: 98vw; max-height: 70vh; height: auto; }
+        button { padding: 12px 30px; cursor: pointer; border: none; font-weight: bold; border-radius: 5px; background: #00d4ff; color: #000; font-size: 1.1rem; }
+        button:disabled { background: #444; color: #888; cursor: wait; }
+        .info-panel { display: flex; gap: 20px; margin-top: 10px; align-items: center; }
+        #healthBarContainer { width: 120px; height: 15px; background: #333; border-radius: 10px; overflow: hidden; border: 1px solid #555; }
+        #healthFill { width: 100%; height: 100%; background: #2ed573; transition: width 0.2s; }
+    </style>
+</head>
+<body>
+
+    <div id="statusInfo">正在連線至伺服器...</div>
+    <button id="startBtn" disabled>讀取中</button>
+
+    <canvas id="gameCanvas" width="420" height="640"></canvas>
+
+    <div class="info-panel">
+        <div id="scoreText">Score: 0</div>
+        <div id="healthBarContainer"><div id="healthFill"></div></div>
+    </div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const statusInfo = document.getElementById('statusInfo');
+    const audioPlayer = new Audio();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // 配置：請確保這些檔案放在 HTML 同一個資料夾下
+    const CONFIG = {
+        midiUrl: 'drums_midi.mid',
+        mp3Url: 'music.mp3'
+    };
+
+    let rawMidiData = [], gameNotes = [], isPlaying = false, isCountingDown = false;
+    let startTime = 0, score = 0, health = 100, countdownValue = 3;
+    let laneFeedback = new Array(7).fill(false);
+
+    // --- 核心：自動加載資源 ---
+    async function preloadAssets() {
+        try {
+            // 1. 下載 MIDI
+            statusInfo.innerText = "正在讀取譜面 (MIDI)...";
+            const midiResponse = await fetch(CONFIG.midiUrl);
+            if (!midiResponse.ok) throw new Error("找不到 MIDI 檔案");
+            const arrayBuffer = await midiResponse.arrayBuffer();
+            const midi = new Midi(arrayBuffer);
+            
+            rawMidiData = [];
+            midi.tracks.forEach(track => {
+                track.notes.forEach(note => {
+                    rawMidiData.push({ time: note.time, lane: note.midi % 7 });
+                });
+            });
+            rawMidiData.sort((a, b) => a.time - b.time);
+
+            // 2. 下載 MP3
+            statusInfo.innerText = "正在讀取音樂 (MP3)...";
+            audioPlayer.src = CONFIG.mp3Url;
+            audioPlayer.load();
+
+            audioPlayer.oncanplaythrough = () => {
+                statusInfo.innerText = "連線成功！可以開始演奏";
+                startBtn.disabled = false;
+                startBtn.innerText = "開始演奏";
+            };
+        } catch (err) {
+            statusInfo.innerText = "載入失敗：" + err.message;
+            console.error(err);
+        }
+    }
+
+    // 啟動加載
+    preloadAssets();
+
+    // 點擊開始 (iOS 必須要有這次點擊才能播放聲音)
+    startBtn.addEventListener('click', () => {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        startBtn.style.display = "none";
+        statusInfo.style.display = "none";
+        startSequence();
+    });
+
+    function startSequence() {
+        isCountingDown = true; countdownValue = 3;
+        score = 0; health = 100;
+        gameNotes = rawMidiData.map(n => ({ ...n, hit: false }));
+        
+        let timer = setInterval(() => {
+            countdownValue--;
+            if (countdownValue <= 0) {
+                clearInterval(timer);
+                isCountingDown = false;
+                isPlaying = true;
+                startTime = performance.now();
+                audioPlayer.play();
+            }
+        }, 1000);
+    }
+
+    // ... (其餘 render 與 handleActionStart 邏輯與之前相同，略) ...
+    // [這裡請保留你之前版本中的 render() 和觸控監聽代碼]
+    
+    // (為了代碼簡潔，以下省略重複的渲染部分，請自行補上)
+    function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#111"; ctx.fillRect(0,0,420,640);
+        for(let i=0; i<7; i++) {
+            if(laneFeedback[i]) { ctx.fillStyle = "rgba(0,212,255,0.2)"; ctx.fillRect(i*60, 0, 60, 540); }
+            ctx.strokeStyle="#333"; ctx.strokeRect(i*60, 0, 60, 640);
+        }
+        ctx.fillStyle="#00d4ff"; ctx.fillRect(0,540,420,4);
+        if (isPlaying) {
+            const now = (performance.now() - startTime) / 1000;
+            gameNotes.forEach(n => {
+                if (n.hit) return;
+                const y = 540 - (n.time - now) * 500;
+                if (y > -20 && y < 640) {
+                    ctx.fillStyle = n.lane === 0 ? "#ff4757" : (n.lane === 2 ? "#ffcc00" : "#fff");
+                    ctx.fillRect(n.lane * 60 + 5, y - 20, 50, 20);
+                }
+                if (y > 590) { n.hit = true; health = Math.max(0, health - 8); }
+            });
+        }
+        if (isCountingDown) {
+            ctx.fillStyle="#fff"; ctx.font="80px Arial"; ctx.textAlign="center";
+            ctx.fillText(countdownValue, 210, 320);
+        }
+        document.getElementById('scoreText').innerText = "Score: " + score;
+        document.getElementById('healthFill').style.width = health + "%";
+        requestAnimationFrame(render);
+    }
+
+    canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        Array.from(e.changedTouches).forEach(t => {
+            const rect = canvas.getBoundingClientRect();
+            const x = (t.clientX - rect.left) * (canvas.width / rect.width);
+            const lane = Math.floor(x / (canvas.width / 7));
+            if (isPlaying) {
+                laneFeedback[lane] = true;
+                const now = (performance.now() - startTime) / 1000;
+                const target = gameNotes.find(n => !n.hit && n.lane === lane && Math.abs(n.time - now) < 0.2);
+                if (target) { target.hit = true; score += 100; health = Math.min(100, health + 2); }
+            }
+        });
+    });
+    canvas.addEventListener('touchend', (e) => {
+        Array.from(e.changedTouches).forEach(t => {
+            const rect = canvas.getBoundingClientRect();
+            const x = (t.clientX - rect.left) * (canvas.width / rect.width);
+            const lane = Math.floor(x / (canvas.width / 7));
+            laneFeedback[lane] = false;
+        });
+    });
+
+    render();
+</script>
+</body>
+</html>
